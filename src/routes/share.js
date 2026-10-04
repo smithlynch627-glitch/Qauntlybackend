@@ -1,0 +1,223 @@
+// Metadata preview for the Create page, and share cards (Open Graph) for collection links.
+import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
+import { createRequire } from 'node:module';
+import { formatUnits } from 'ethers';
+import { config } from '../config.js';
+import { ah, bad, notFound } from '../lib/http.js';
+import { loadCollection } from '../lib/queries.js';
+import { assertSafeImage, safeGet } from '../lib/safeFetch.js';
+import { fetchJsonUri, hasRawCidPath, ipfsToHttp, metadataMedia, probeImage } from '../indexer/core.js';
+import { parseIpfs } from '../lib/ipfs.js';
+import { inspectBase, validateBase } from '../lib/metaCheck.js';
+
+const r = Router();
+r.use(rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false }));
+
+const DEV = process.env.ALLOW_PRIVATE_FETCH === '1';
+const isAllowedUri = (u) => /^(ipfs:\/\/|ar:\/\/|https:\/\/)/.test(u) || (DEV && u.startsWith('http://'));
+async function readMeta(uri) {
+  if (/^https?:\/\//.test(uri)) {
+    const { buf } = await safeGet(uri, { maxBytes: 1_000_000, accept: 'application/json' });
+    return JSON.parse(buf.toString('utf8'));
+  }
+  return fetchJsonUri(uri, { timeout: 10_000 });
+}
+
+/**
+ * GET /api/share/metadata?base=ipfs://CID/&ids=1,2,3  → checks the folder the contract will point to (base + id + ".json")
+ * GET /api/share/metadata?uri=ipfs://…/hidden.json     → checks one metadata file (e.g. pre-reveal)
+ */
+r.get('/metadata', ah(async (req, res) => {
+  const base = String(req.query.base || '').trim();
+  const single = String(req.query.uri || '').trim();
+  if (single) {
+    if (!isAllowedUri(single) && !single.startsWith('data:application/json')) throw bad('Use an ipfs://, ar:// or https:// link');
+    try {
+      const m = await readMeta(single);
+      return res.json({ items: [{ ok: true, name: m.name ?? null, image: metadataMedia(m), attributes: Array.isArray(m.attributes) ? m.attributes.length : 0 }] });
+    } catch (e) {
+      return res.json({ items: [{ ok: false, error: e.message }] });
+    }
+  }
+  if (!isAllowedUri(base)) throw bad('Base URI must start with ipfs://, ar:// or https://');
+  if (!base.endsWith('/')) throw bad('Base URI must end with "/" (the contract adds "<id>.json")');
+  const ids = [...new Set(String(req.query.ids || '1,2,3').split(',').map((x) => x.trim()).filter((x) => /^\d{1,6}$/.test(x)))].slice(0, 5);
+  const items = await Promise.all(ids.map(async (id) => {
+    const uri = `${base}${id}.json`;
+    try {
+      const m = await readMeta(uri);
+      const attrs = Array.isArray(m.attributes) ? m.attributes : [];
+      const raw = m.image || m.image_url || (typeof m.image_data === 'string' && m.image_data.includes('<svg') ? `data:image/svg+xml;base64,${Buffer.from(m.image_data).toString('base64')}` : null) || m.animation_url || null;
+      // Is the image itself reachable? (Metadata can load while its image link is broken.)
+      const probe = raw ? await probeImage(raw) : { ok: false, error: 'no image field' };
+      return {
+        id, uri, ok: true, name: typeof m.name === 'string' ? m.name.trim() : null, image: ipfsToHttp(raw), attributes: attrs.slice(0, 20), hasImage: Boolean(raw),
+        rawImage: typeof raw === 'string' ? raw.slice(0, 300) : null,
+        imageIssue: hasRawCidPath(raw) || probe.bareCid ? 'raw_cid_path' : null,
+        imageOk: probe.ok, imageError: probe.ok ? null : probe.error,
+      };
+    } catch (e) {
+      return { id, uri, ok: false, error: e.message };
+    }
+  }));
+  res.json({ items });
+}));
+
+/**
+ * GET /api/share/ipfs/inspect?base=ipfs://CID/&supply=222 → what is in the folder + tokens 1, 2 and the last one.
+ * GET /api/share/ipfs/validate?base=…&supply=…             → every token file and the images folder.
+ * Both answer { stage: "pending" } while IPFS is still spreading a fresh upload; the page asks again shortly.
+ */
+const baseOf = (req) => {
+  const base = String(req.query.base || '').trim();
+  if (!parseIpfs(base)) throw bad('Use an ipfs://… folder link');
+  if (!base.endsWith('/')) throw bad('The folder link must end with "/" (the contract adds "<id>.json")');
+  const supply = Math.max(0, Math.min(200_000, Number.parseInt(String(req.query.supply || '0'), 10) || 0));
+  return { base, supply };
+};
+r.get('/ipfs/inspect', ah(async (req, res) => {
+  const { base, supply } = baseOf(req);
+  res.json(await inspectBase(base, supply));
+}));
+r.get('/ipfs/validate', ah(async (req, res) => {
+  const { base, supply } = baseOf(req);
+  try {
+    res.json({ stage: 'found', ...(await validateBase(base, supply)) });
+  } catch (e) {
+    res.json(e.notFound ? { stage: 'bad', error: e.message } : { stage: 'pending', error: e.message });
+  }
+}));
+
+// ── Share cards ─────────────────────────────────────────────────────────────
+// The image renderer is loaded on first use, so a missing native package can never stop the API from starting.
+const require = createRequire(import.meta.url);
+let renderer = null;
+async function getRenderer() {
+  if (renderer) return renderer;
+  try {
+    const { Resvg } = await import('@resvg/resvg-js');
+    const dir = (pkg) => require.resolve(`${pkg}/package.json`).replace(/package\.json$/, '');
+    const fonts = [
+      `${dir('@expo-google-fonts/bricolage-grotesque')}700Bold/BricolageGrotesque_700Bold.ttf`,
+      ...['400Regular/Geist_400Regular.ttf', '500Medium/Geist_500Medium.ttf', '600SemiBold/Geist_600SemiBold.ttf'].map((f) => `${dir('@expo-google-fonts/geist')}${f}`),
+    ];
+    renderer = { Resvg, fonts };
+    return renderer;
+  } catch (e) {
+    throw new Error(`Share cards need "npm install" in the backend folder (${e.code || e.message})`);
+  }
+}
+const cache = new Map();
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+function coinShort(wei) {
+  if (wei === null || wei === undefined) return '—';
+  const n = Number(formatUnits(BigInt(wei), 18));
+  const unit = config.nativeSymbol;
+  if (n === 0) return `0 ${unit}`;
+  const text = n >= 100 ? n.toFixed(0) : n >= 1 ? n.toFixed(2) : n.toPrecision(3);
+  return `${text.includes('.') ? text.replace(/\.?0+$/, '') : text} ${unit}`;
+}
+
+function statsOf(c) {
+  return [
+    ['Floor', coinShort(c.floor_wei)], ['Best offer', coinShort(c.best_offer_wei)],
+    ['24h volume', coinShort(c.volume_24h_wei)], ['Total volume', coinShort(c.volume_wei)],
+    ['Items', Number(c.total_supply || 0).toLocaleString('en-US')], ['Owners', Number(c.owners_count || 0).toLocaleString('en-US')],
+  ];
+}
+
+async function imageDataUri(url) {
+  if (!url) return null;
+  try {
+    const { buf } = await safeGet(ipfsToHttp(url), { maxBytes: 4_000_000, timeout: 6000 });
+    const sig = buf.subarray(0, 4).toString('hex');
+    const mime = sig.startsWith('89504e47') ? 'image/png' : sig.startsWith('ffd8ff') ? 'image/jpeg' : sig.startsWith('47494638') ? 'image/gif' : null;
+    if (!mime) return null; // (WebP/SVG are skipped)
+    assertSafeImage(buf, 16_000_000); // a tiny file claiming a gigantic size would exhaust the server's memory
+    return `data:${mime};base64,${buf.toString('base64')}`;
+  } catch {
+    return null;
+  }
+}
+
+// Card colours and type follow the website: white, the QMS purple, Bricolage Grotesque and Geist.
+const PAPER = '#ffffff', WASH = '#f4f1ff', LINE = '#d9d2f5', TEXT = '#15102b', MUTED = '#7a7496', PURPLE = '#6c4cf5', PURPLE_TEXT = '#5a3de0', DEEP = '#4527c9', LILAC = '#a48bff';
+const DISPLAY = 'Bricolage Grotesque', SANS = 'Geist';
+
+async function renderCard(c) {
+  const img = await imageDataUri(c.image_url);
+  const name = c.name.length > 24 ? `${c.name.slice(0, 23)}…` : c.name;
+  const stats = statsOf(c);
+  const cells = stats.map(([k, v], i) => {
+    const x = 560 + (i % 2) * 300;
+    const y = 312 + Math.floor(i / 2) * 86;
+    return `<text x="${x}" y="${y}" font-family="${SANS}" font-size="19" font-weight="500" fill="${MUTED}">${esc(k)}</text>
+            <text x="${x}" y="${y + 44}" font-family="${DISPLAY}" font-size="36" font-weight="700" letter-spacing="-0.8" fill="${TEXT}">${esc(v)}</text>`;
+  }).join('');
+  const art = img
+    ? `<clipPath id="r"><rect x="70" y="92" width="420" height="420" rx="32"/></clipPath><image href="${img}" x="70" y="92" width="420" height="420" preserveAspectRatio="xMidYMid slice" clip-path="url(#r)"/>`
+    : `<rect x="70" y="92" width="420" height="420" rx="32" fill="url(#g)"/><text x="280" y="356" text-anchor="middle" font-family="${DISPLAY}" font-size="170" font-weight="700" fill="#ffffff">${esc(c.name.slice(0, 1).toUpperCase())}</text>`;
+  const kind = c.is_official ? 'Official collection' : c.verified ? 'Verified collection' : 'NFT collection';
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+    <defs>
+      <linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b6dff"/><stop offset="0.55" stop-color="${PURPLE}"/><stop offset="1" stop-color="${DEEP}"/></linearGradient>
+      <radialGradient id="a" cx="0.92" cy="0.02" r="0.75"><stop offset="0" stop-color="${LILAC}" stop-opacity="0.42"/><stop offset="1" stop-color="${LILAC}" stop-opacity="0"/></radialGradient>
+      <radialGradient id="b" cx="0.02" cy="0.9" r="0.6"><stop offset="0" stop-color="${PURPLE}" stop-opacity="0.2"/><stop offset="1" stop-color="${PURPLE}" stop-opacity="0"/></radialGradient>
+    </defs>
+    <rect width="1200" height="630" fill="${PAPER}"/>
+    <rect width="1200" height="630" fill="url(#a)"/>
+    <rect width="1200" height="630" fill="url(#b)"/>
+    <rect x="82" y="108" width="420" height="420" rx="32" fill="${PURPLE}" fill-opacity="0.16"/>
+    <rect x="70" y="92" width="420" height="420" rx="32" fill="${WASH}"/>
+    ${art}
+    <rect x="70" y="92" width="420" height="420" rx="32" fill="none" stroke="${LINE}" stroke-width="2"/>
+    <rect x="560" y="104" width="${kind.length * 11 + 44}" height="40" rx="20" fill="${WASH}" stroke="${LINE}"/>
+    <circle cx="582" cy="124" r="5" fill="${PURPLE}"/>
+    <text x="596" y="131" font-family="${SANS}" font-size="18" font-weight="600" fill="${PURPLE_TEXT}">${esc(kind)}</text>
+    <text x="558" y="${name.length > 16 ? 212 : 220}" font-family="${DISPLAY}" font-size="${name.length > 16 ? 50 : 64}" font-weight="700" letter-spacing="-2" fill="${TEXT}">${esc(name)}</text>
+    <text x="560" y="258" font-family="${SANS}" font-size="21" fill="${MUTED}">${esc(`On ${config.networkName}`)}</text>
+    ${cells}
+    <rect x="0" y="566" width="1200" height="64" fill="url(#g)"/>
+    <rect x="70" y="582" width="32" height="32" rx="9" fill="#ffffff"/>
+    <circle cx="85" cy="597" r="7" fill="none" stroke="${PURPLE}" stroke-width="4"/><line x1="90" y1="602" x2="95" y2="607" stroke="${PURPLE}" stroke-width="4" stroke-linecap="round"/>
+    <text x="114" y="606" font-family="${DISPLAY}" font-size="24" font-weight="700" letter-spacing="-0.6" fill="#ffffff">${esc(config.brand)}</text>
+    <text x="1130" y="605" text-anchor="end" font-family="${SANS}" font-size="18" font-weight="500" fill="#ffffff" fill-opacity="0.9">NFT launchpad and marketplace</text>
+  </svg>`;
+  const { Resvg, fonts } = await getRenderer();
+  return new Resvg(svg, { font: { fontFiles: fonts, loadSystemFonts: false, defaultFontFamily: SANS }, fitTo: { mode: 'width', value: 1200 } }).render().asPng();
+}
+
+const SLUG = /^([a-z0-9-]{1,80}|0x[0-9a-fA-F]{40})$/;
+
+/** PNG card: collection image + floor, best offer, 24h / total volume, items, owners. */
+r.get('/collection/:slug.png', ah(async (req, res) => {
+  if (!SLUG.test(req.params.slug)) throw notFound();
+  const c = await loadCollection(req.params.slug);
+  const key = `${c.address}:${c.floor_wei}:${c.best_offer_wei}:${c.volume_24h_wei}:${c.volume_wei}:${c.image_url}:${c.name}`;
+  let png = cache.get(key);
+  if (!png) {
+    png = await renderCard(c);
+    if (cache.size > 300) cache.clear();
+    cache.set(key, png);
+  }
+  res.set({ 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=600', 'Cross-Origin-Resource-Policy': 'cross-origin' });
+  res.send(png);
+}));
+
+/** Tags for link previews (used by the website's edge function). */
+r.get('/collection/:slug', ah(async (req, res) => {
+  if (!SLUG.test(req.params.slug)) throw notFound();
+  const c = await loadCollection(req.params.slug);
+  const s = Object.fromEntries(statsOf(c));
+  res.set('Cache-Control', 'public, max-age=120');
+  res.json({
+    title: `${c.name} | ${config.brand}`,
+    description: `Floor ${s.Floor}, best offer ${s['Best offer']}, 24h volume ${s['24h volume']}, total volume ${s['Total volume']}. ${s.Items} items, ${s.Owners} owners on ${config.networkName}.`,
+    image: `${config.apiPublicUrl}/api/share/collection/${c.slug}.png?v=${Math.floor(Date.now() / 600_000)}`,
+    slug: c.slug,
+  });
+}));
+
+export default r;
