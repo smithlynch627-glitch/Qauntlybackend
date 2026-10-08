@@ -20,10 +20,15 @@ import admin from './routes/admin.js';
 import share from './routes/share.js';
 import support from './routes/support.js';
 import xConnect from './routes/x.js';
+import apiKeys from './routes/apiKeys.js';
+import adminApiKeys from './routes/adminApiKeys.js';
+import v1 from './routes/v1.js';
 import { loadNetwork, watchNetwork } from './lib/network.js';
 
 const app = express();
 const blockedOrigins = new Set();
+// The public API (/api/v1) is for servers and bots with an API key: no CORS for it, and its limits are per key.
+const isV1 = (req) => /^\/api\/v1(\/|\?|$)/.test(req.originalUrl || '');
 // Railway puts one proxy in front of the API. Behind Cloudflare too, set TRUST_PROXY=2 so rate limits see the real visitor.
 app.set('trust proxy', Math.max(0, Math.min(5, Number(process.env.TRUST_PROXY ?? 1))));
 app.use(
@@ -35,29 +40,31 @@ app.use(
   }),
 );
 app.disable('x-powered-by');
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      const ok = !origin || config.corsOrigins.includes(origin) || config.adminOrigins.includes(origin);
-      if (!ok && !blockedOrigins.has(origin) && blockedOrigins.size < 200) {
-        blockedOrigins.add(origin);
-        console.warn(`[cors] blocked ${origin}. Add it to CORS_ORIGINS (website) or ADMIN_ORIGINS (admin app) in .env and restart.`);
-      }
-      cb(null, ok);
-    },
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    allowedHeaders: ['content-type', 'authorization'],
-    maxAge: 600,
-  }),
-);
+const corsMiddleware = cors({
+  origin: (origin, cb) => {
+    const ok = !origin || config.corsOrigins.includes(origin) || config.adminOrigins.includes(origin);
+    if (!ok && !blockedOrigins.has(origin) && blockedOrigins.size < 200) {
+      blockedOrigins.add(origin);
+      console.warn(`[cors] blocked ${origin}. Add it to CORS_ORIGINS (website) or ADMIN_ORIGINS (admin app) in .env and restart.`);
+    }
+    cb(null, ok);
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+  allowedHeaders: ['content-type', 'authorization'],
+  maxAge: 600,
+});
+// Requests without an Origin header (servers, scripts) pass; /api/v1 never gets CORS headers, so browsers can't use keys.
+app.use((req, res, next) => (isV1(req) ? next() : corsMiddleware(req, res, next)));
 app.use(compression());
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/auth', rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false }));
 
-app.use('/api', rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: 'draft-7', legacyHeaders: false }));
+// /api/v1 has its own per-key limits and a per-IP backstop (routes/v1.js), so it is not counted here.
+app.use('/api', rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: 'draft-7', legacyHeaders: false, skip: isV1 }));
 const writeLimit = rateLimit({ windowMs: 60_000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false });
 app.use((req, res, next) => (req.method === 'GET' ? next() : writeLimit(req, res, next)));
 
+app.use('/api/v1', v1);
 app.use('/api', meta);
 app.use('/api/collections', collections);
 app.use('/api/tokens', tokens);
@@ -67,6 +74,8 @@ app.use('/api/drops', drops);
 app.use('/api/orders', orders);
 app.use('/api/uploads', uploads);
 app.use('/api/media', media);
+app.use('/api/keys', apiKeys);
+app.use('/api/admin/api-keys', adminApiKeys);
 app.use('/api/admin', admin);
 app.use('/api/share', share);
 app.use('/api/support', support);
@@ -79,6 +88,8 @@ app.use((err, _req, res, _next) => {
   if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, code: err.code });
   if (err?.type === 'entity.too.large') return res.status(413).json({ error: 'Request is too large', code: 'too_large' });
   if (err?.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File is too large', code: 'too_large' });
+  // The database enforces its own size limits; a value that breaks one is a bad request, not a server fault.
+  if (['23514', '22001', '22P05', '22007', '22008', '22P02'].includes(err?.code)) return res.status(400).json({ error: 'Some of these details are too long or not in the expected format', code: 'bad_request' });
   const db = describeDbError(err);
   if (db) {
     console.error(`[db] ${db}`);
@@ -94,6 +105,9 @@ function describeDbError(err) {
   const msg = String(err?.message || '');
   if (code === '42P01' && /safe_proposals|safe_signatures|treasury_events|treasury_cursor/.test(msg)) {
     return 'The admin v2 tables are missing. Run backend/db/04_admin_v2.sql once in Supabase → SQL Editor, then reload the admin page.';
+  }
+  if (code === '42P01' && /api_keys|api_key_usage/.test(msg)) {
+    return 'The API key tables are missing. Run backend/db/setup_all.sql again in Supabase → SQL Editor (or only db/08_api_keys.sql).';
   }
   if (code === '42P01') return 'Database tables are missing. Run db/01_schema.sql (npm run db:init)';
   if (code === 'ECONNRESET' || /Connection terminated unexpectedly/i.test(msg))
@@ -118,6 +132,13 @@ async function checkDatabase() {
     }
     const v2 = await getPool().query(`select to_regclass('app.safe_proposals') as t`);
     if (!v2.rows[0].t) console.warn('[db] Admin v2 tables are missing: run backend/db/04_admin_v2.sql in the Supabase SQL editor (Treasury and Multisig need them).');
+    const keys = await getPool().query(`select to_regclass('app.api_keys') as t`);
+    if (!keys.rows[0].t) console.warn('[db] API key tables are missing: run backend/db/setup_all.sql again in the Supabase SQL editor (API keys and /api/v1 need them).');
+    const pv = await getPool().query(
+      `select count(*)::int as n from information_schema.columns
+       where table_schema = 'app' and table_name = 'users' and column_name in ('hide_collected', 'hide_activity')`,
+    );
+    if (pv.rows[0].n < 2) console.warn('[db] Profile privacy columns are missing: run backend/db/setup_all.sql again in the Supabase SQL editor (until then every profile is public and the switches cannot be saved).');
     console.log(`[db] Connected to ${host} over ${/localhost|127\.0\.0\.1/.test(config.databaseUrl) ? 'a local socket' : config.databaseCa ? 'verified TLS' : 'TLS'}.`);
   } catch (e) {
     console.error(`[db] ${describeDbError(e) || e.message} (host: ${host})`);

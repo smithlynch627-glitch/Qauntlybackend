@@ -26,6 +26,7 @@ const TOPIC = {
   mintPaused: T(colIface, 'MintPausedSet'),
   contractUri: T(colIface, 'ContractURIUpdated'),
   supplyReduced: T(colIface, 'MaxSupplyReduced'),
+  ownership: T(colIface, 'OwnershipTransferred'),
 };
 
 const lc = (v) => String(v).toLowerCase();
@@ -339,6 +340,12 @@ export async function processLogs(logs) {
           if (d) await logConfigChange(address, d.phases, [change], { ts, txHash: `${txHash}:${log.index}` }).catch(() => {});
         }
         await syncCollectionFromChain(address).catch((e) => console.warn('[sync]', address, e.message));
+      } else if (topic === TOPIC.ownership) {
+        // A finished handover (the new owner accepted in the Studio): the page shows who runs the collection now.
+        // The owner is read from the contract, never taken from the event: an old transaction sent again
+        // (anyone can ask for a transaction to be re-read) must not bring back a previous owner.
+        const now = await collectionContract(address).owner().then(lc).catch(() => null);
+        if (now && now !== ZERO_ADDRESS) await q(`update collections set creator = $2 where address = $1 and not is_external`, [address, now]);
       } else if (topic === TOPIC.approvalForAll) {
         const ev = parse(colIface, log);
         if (ev && lc(ev.args.operator) === config.market && !ev.args.approved) {
@@ -481,6 +488,9 @@ const queue = [];
 const pending = new Set();
 let running = false;
 const touchedForRarity = new Set();
+
+/** How many metadata reads are waiting (the creator refresh refuses new work while this is high). */
+export const metadataQueueSize = () => queue.length;
 
 export function queueMetadata(collection, tokenId, attempt = 0) {
   const key = `${collection}:${tokenId}`;

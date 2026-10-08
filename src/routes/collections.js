@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { many, one } from '../db.js';
-import { ah, clampInt, microCache } from '../lib/http.js';
+import { addrParam, ah, clampInt, microCache } from '../lib/http.js';
+import { optionalAuth } from '../lib/auth.js';
+import { requireVisible } from '../lib/privacy.js';
 import { BEST_LISTING_JOIN, COLLECTION_COLS, NO_TRAIT, TOKEN_COLS, loadCollection, loadDrop, traitCounts } from '../lib/queries.js';
 import { maybeRepair } from '../indexer/core.js';
 
@@ -66,7 +68,7 @@ const BEST_OFFER_JOIN = `left join lateral (
  * status (all | listed | unlisted | offers), price range (native coin), rarity rank range, traits (any value within a
  * trait type, all trait types together), owner, search by name or #id, and sort.
  */
-r.get('/:key/tokens', ah(async (req, res) => {
+r.get('/:key/tokens', optionalAuth, ah(async (req, res) => {
   const col = await loadCollection(req.params.key);
   const params = [col.address];
   const where = [`t.collection = $1`, `t.owner is not null`];
@@ -87,7 +89,13 @@ r.get('/:key/tokens', ah(async (req, res) => {
   const rankMax = Number.parseInt(String(req.query.rank_max ?? ''), 10);
   if (Number.isFinite(rankMin) && rankMin > 0) where.push(`t.rarity_rank >= ${add(rankMin)}`);
   if (Number.isFinite(rankMax) && rankMax > 0) where.push(`t.rarity_rank <= ${add(rankMax)}`);
-  if (req.query.owner) where.push(`t.owner = ${add(String(req.query.owner).toLowerCase())}`);
+  if (req.query.owner) {
+    // "Only my items" on a collection page: follows that wallet's privacy setting (the wallet itself always sees them).
+    const owner = addrParam(req.query.owner, 'owner');
+    await requireVisible(req, owner, 'collected');
+    res.set('Cache-Control', 'private, no-store');
+    where.push(`t.owner = ${add(owner)}`);
+  }
   const qs = String(req.query.q || '').trim().slice(0, 80);
   if (/^#?\d{1,20}$/.test(qs)) where.push(`t.token_id = ${add(qs.replace('#', ''))}`);
   else if (qs) where.push(`t.name ilike ${add(`%${qs.replace(/[%_\\]/g, '')}%`)}`);
@@ -176,7 +184,8 @@ r.get('/:key/holders', microCache(15_000), ah(async (req, res) => {
   const minHeld = clampInt(req.query.min_held, 0, 1_000_000, 0);
   if (minHeld > 1) filters.push(`held >= ${add(minHeld)}`);
   const qs = String(req.query.q || '').trim().toLowerCase().slice(0, 64);
-  if (qs) filters.push(`(rows.owner like ${add(`%${qs.replace(/[%_\\]/g, '')}%`)} or lower(u.username) like ${add(`%${qs.replace(/[%_\\]/g, '')}%`)})`);
+  // A search never finds wallets that keep their lists private (their rows are shown without a name below).
+  if (qs) filters.push(`(rows.owner like ${add(`%${qs.replace(/[%_\\]/g, '')}%`)} or lower(u.username) like ${add(`%${qs.replace(/[%_\\]/g, '')}%`)}) and not (coalesce((to_jsonb(u) ->> 'hide_collected')::boolean, false) or coalesce((to_jsonb(u) ->> 'hide_activity')::boolean, false))`);
   const rows = await many(
     `with holders as (
        select owner, count(*)::int as held from tokens
@@ -192,7 +201,7 @@ r.get('/:key/holders', microCache(15_000), ah(async (req, res) => {
          coalesce(s.amt, 0) + h.held * $3::numeric - coalesce(m.amt, 0) - coalesce(b.amt, 0) as pnl, rk.rank
        from holders h join ranked rk using (owner)
        left join buys b on b.addr = h.owner left join sells s on s.addr = h.owner left join mints m on m.addr = h.owner)
-     select rows.*, u.username, count(*) over() as total_count,
+     select rows.*, u.username, (coalesce((to_jsonb(u) ->> 'hide_collected')::boolean, false) or coalesce((to_jsonb(u) ->> 'hide_activity')::boolean, false)) as private, count(*) over() as total_count,
        (select coalesce(json_agg(x), '[]') from (
           select t.token_id::text as token_id, t.name, t.image_url, t.rarity_rank from tokens t
           where t.collection = $1 and t.owner = rows.owner order by t.rarity_rank asc nulls last, t.token_id limit 5) x) as samples
@@ -214,7 +223,11 @@ r.get('/:key/holders', microCache(15_000), ah(async (req, res) => {
   );
   res.json({
     // rank = position by items held (stays the same whatever the sort or filter).
-    holders: rows.map(({ total_count, ...h }) => ({ ...h, share: supply ? h.held / supply : 0 })),
+    // Wallets that hide their items or activity stay in the numbers but without address, name or items.
+    holders: rows.map(({ total_count, ...h }) => ({
+      ...h, share: supply ? h.held / supply : 0,
+      ...(h.private ? { owner: null, username: null, samples: [] } : {}),
+    })),
     total: Number(rows[0]?.total_count ?? 0),
     summary: {
       holders: summary.holders,

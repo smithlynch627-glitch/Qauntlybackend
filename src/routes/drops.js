@@ -1,14 +1,16 @@
 import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
 import { connectedXLink, xReady } from './x.js';
 import { StandardMerkleTree } from '@openzeppelin/merkle-tree';
 import { config } from '../config.js';
-import { many, one, q } from '../db.js';
-import { addrParam, ah, bad, clampInt, forbidden } from '../lib/http.js';
+import { many, one, tx } from '../db.js';
+import { HttpError, addrParam, ah, bad, clampInt, forbidden } from '../lib/http.js';
 import { requireAuth } from '../lib/auth.js';
 import { COLLECTION_COLS, loadCollection, loadDrop } from '../lib/queries.js';
 import { dropState } from '../lib/drops.js';
 import { collectionContract, isLaunchpadCollection } from '../lib/chain.js';
-import { maybeRepair, phaseTxContext, syncCollectionFromChain } from '../indexer/core.js';
+import { maybeRepair, metadataQueueSize, phaseTxContext, queueMetadata, syncCollectionFromChain } from '../indexer/core.js';
+import { cleanAbout, cleanAboutItems, cleanGallery, cleanMediaLink, cleanText, galleryReady } from '../lib/collectionMedia.js';
 
 const r = Router();
 const publicPhases = (phases) => phases.map(({ allowlistId, merkleRoot, ...p }) => ({ ...p, hasAllowlist: Boolean(merkleRoot && !/^0x0+$/.test(merkleRoot)) }));
@@ -83,6 +85,8 @@ r.post('/allowlists', requireAuth, ah(async (req, res) => {
 /**
  * Registers display details for a launchpad collection (text, images, links, phase names, allowlists).
  * Only the on-chain owner can do this. Prices, times, limits and roots always come from the contract.
+ * Images: logo (imageUrl), banner (bannerUrl) and up to three extra images (gallery) for the mint page.
+ * About tab: story (about), its picture (aboutImageUrl) and up to 12 detail rows (aboutItems).
  */
 r.post('/', requireAuth, ah(async (req, res) => {
   const b = req.body || {};
@@ -97,25 +101,18 @@ r.post('/', requireAuth, ah(async (req, res) => {
     b.twitter = await connectedXLink(req.user);
     if (!b.twitter) throw bad('Connect your X account first (Create → Details → Connect X).');
   }
-  // Only the fields that were sent are changed (the Studio sends partial updates).
-  const fields = { description: 'description', imageUrl: 'image_url', bannerUrl: 'banner_url', twitter: 'twitter', website: 'website', discord: 'discord', telegram: 'telegram' };
-  const sets = [];
-  const params = [address];
-  for (const [k, col] of Object.entries(fields)) {
-    if (!(k in b)) continue;
-    params.push(k === 'description' ? String(b.description || '').slice(0, 2000) : k === 'imageUrl' || k === 'bannerUrl' ? safeImage(b[k]) : safeLink(b[k]));
-    sets.push(`${col} = $${params.length}`);
-  }
-  if (sets.length) await q(`update collections set ${sets.join(', ')} where address = $1`, params);
+  const page = await pageFields(b);
+  const names = phaseNames(b.phases);
 
+  // Everything is checked before anything is written, and both tables change together or not at all.
   const d = await one(`select phases from drops where collection = $1`, [address]);
   const phases = d.phases;
   const open = (p) => !p.merkleRoot || /^0x0+$/.test(p.merkleRoot);
-  for (const [i, meta] of (b.phases || []).slice(0, phases.length).entries()) {
-    if (meta?.name) phases[i].name = String(meta.name).trim().slice(0, 32) || phases[i].name;
+  for (const [i, meta] of names.slice(0, phases.length).entries()) {
+    if (meta.name) phases[i].name = meta.name;
     // "Public" is reserved for the last phase, which is open to everyone.
     if (/^public$/i.test(phases[i].name) && !(i === phases.length - 1 && open(phases[i]))) phases[i].name = `Phase ${i + 1}`;
-    if (meta?.allowlistId) {
+    if (meta.allowlistId) {
       const al = await one(`select root from allowlists where id = $1`, [meta.allowlistId]);
       if (!al || al.root.toLowerCase() !== phases[i].merkleRoot) throw bad(`Phase ${i + 1}: allowlist does not match the on-chain root`);
       phases[i].allowlistId = meta.allowlistId;
@@ -123,9 +120,65 @@ r.post('/', requireAuth, ah(async (req, res) => {
   }
   const last = phases[phases.length - 1];
   if (last && open(last)) last.name = 'Public';
-  await q(`update drops set phases = $2 where collection = $1`, [address, JSON.stringify(phases)]);
-  res.json({ collection: await loadCollection(address) });
+  await tx(async (h) => {
+    if (page.sets.length) await h.q(`update collections set ${page.sets.join(', ')} where address = $1`, [address, ...page.params]);
+    await h.q(`update drops set phases = $2 where collection = $1`, [address, JSON.stringify(phases)]);
+  });
+  res.json({ collection: await loadCollection(address), ...(page.warnings.length ? { warnings: page.warnings } : {}) });
 }));
+
+/**
+ * Checks the page details of a collection without saving anything. The Create page calls this before the
+ * deploy transaction, so a link the API would refuse is found while it can still be fixed for free.
+ */
+r.post('/check', requireAuth, ah(async (req, res) => {
+  const b = req.body || {};
+  delete b.twitter; // set by the API from the connected X account, never typed
+  await pageFields(b);
+  phaseNames(b.phases);
+  res.json({ ok: true });
+}));
+
+/**
+ * The page details in a request, checked and ready to save: `sets` are "column = $n" pieces (numbered from $2,
+ * $1 is the collection address) and `params` their values. Only the fields that were sent are changed, because
+ * the Studio saves one section at a time. Nothing here touches the database except the gallery-column lookup.
+ */
+async function pageFields(b) {
+  const sets = [];
+  const params = [];
+  const warnings = [];
+  const set = (col, val) => { params.push(val); sets.push(`${col} = $${params.length + 1}`); };
+  if ('description' in b) set('description', cleanText(b.description, 2000));
+  // A collection always keeps a logo: an empty logo field changes nothing.
+  if ('imageUrl' in b && String(b.imageUrl ?? '').trim()) set('image_url', cleanMediaLink(b.imageUrl, 'Logo'));
+  if ('bannerUrl' in b) set('banner_url', cleanMediaLink(b.bannerUrl, 'Banner'));
+  for (const [k, col] of [['twitter', 'twitter'], ['website', 'website'], ['discord', 'discord'], ['telegram', 'telegram']]) {
+    if (k in b) set(col, safeLink(b[k]));
+  }
+  // Extra images need the gallery column (db/setup_all.sql). Without it the rest is still saved (a new collection
+  // must never lose its details over this) and the reply says the extra images were skipped.
+  if ('gallery' in b) {
+    const gallery = cleanGallery(b.gallery);
+    if (await galleryReady()) set('gallery', JSON.stringify(gallery));
+    else if (gallery.length) warnings.push('gallery_not_ready');
+  }
+  if ('about' in b) set('about', cleanAbout(b.about));
+  if ('aboutImageUrl' in b) set('about_image_url', cleanMediaLink(b.aboutImageUrl, 'About image'));
+  if ('aboutItems' in b) set('about_items', JSON.stringify(cleanAboutItems(b.aboutItems)));
+  return { sets, params, warnings };
+}
+
+/** Phase display names and allowlist ids sent with the page details: a list of at most 20 small objects. */
+function phaseNames(list) {
+  if (list === undefined || list === null) return [];
+  if (!Array.isArray(list) || list.length > 20) throw bad('Phases must be a list');
+  return list.map((m, i) => {
+    const id = m?.allowlistId ?? null;
+    if (id !== null && !(typeof id === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id))) throw bad(`Phase ${i + 1}: allowlist not found`);
+    return { name: typeof m?.name === 'string' ? cleanText(m.name, 100).trim().slice(0, 32) : '', allowlistId: id };
+  });
+}
 
 /** Social / website links: https only (no javascript:, data: or plain http links on the collection page). */
 function safeLink(v) {
@@ -139,13 +192,40 @@ function safeLink(v) {
   return s;
 }
 
-/** Logo / banner: https, ipfs:// or an embedded PNG/JPG/GIF/WebP/AVIF image. */
-function safeImage(v) {
-  if (!v) return null;
-  const s = String(v).trim();
-  if (/^data:image\/(png|jpeg|gif|webp|avif);base64,[a-z0-9+/=]+$/i.test(s) && s.length < 1_300_000) return s;
-  if (/^(https:\/\/|ipfs:\/\/)[^\s"'<>\\]+$/i.test(s) && s.length <= 500) return s;
-  throw bad('Images must be an https:// or ipfs:// link');
-}
+/**
+ * "Refresh on Quantly": reloads every token's name, picture and traits from the link the contract uses now.
+ * Useful when a creator changed files behind the same https link (IPFS links change when files change, and
+ * those are picked up on their own). Only the on-chain owner, and once every 10 minutes per collection.
+ */
+const REFRESH_EVERY_MS = 10 * 60_000;
+const REFRESH_QUEUE_MAX = 40_000; // metadata reads waiting, from every source, above which refreshes wait
+const lastRefresh = new Map();
+// Per wallet as well, so one creator with many collections can't fill the queue for everyone else.
+const refreshPerWallet = rateLimit({ windowMs: 3600_000, limit: 6, keyGenerator: (req) => req.user, standardHeaders: 'draft-7', legacyHeaders: false,
+  handler: (_req, _res, next) => next(new HttpError(429, 'You refreshed several collections in the last hour. Try again later.', 'refresh_wait')) });
+r.post('/:address/refresh', requireAuth, refreshPerWallet, ah(async (req, res) => {
+  const address = addrParam(req.params.address, 'collection');
+  if (!(await isLaunchpadCollection(address))) throw bad('This contract was not created by the launchpad');
+  const owner = String(await collectionContract(address).owner()).toLowerCase();
+  if (owner !== req.user) throw forbidden('Only the collection owner can refresh it');
+  const now = Date.now();
+  for (const [k, at] of lastRefresh) if (now - at >= REFRESH_EVERY_MS) lastRefresh.delete(k);
+  const wait = (lastRefresh.get(address) || 0) + REFRESH_EVERY_MS - now;
+  if (wait > 0) throw new HttpError(429, `This collection was refreshed a moment ago. Try again in ${Math.ceil(wait / 60_000)} min.`, 'refresh_wait');
+  if (metadataQueueSize() > REFRESH_QUEUE_MAX) throw new HttpError(503, 'Many pictures are being loaded right now. Try again in a few minutes.', 'busy');
+  lastRefresh.set(address, now);
+  try {
+    await syncCollectionFromChain(address);
+  } catch (e) {
+    lastRefresh.delete(address); // a failed read does not use up the 10 minutes
+    throw e;
+  }
+  const ids = await many(
+    `select token_id::text as id from tokens where collection = $1 and owner is not null order by token_id limit 20000`,
+    [address],
+  );
+  ids.forEach((t) => queueMetadata(address, t.id));
+  res.json({ ok: true, tokens: ids.length });
+}));
 
 export default r;

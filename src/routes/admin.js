@@ -6,9 +6,11 @@ import { config } from '../config.js';
 import { many, one, q, tx } from '../db.js';
 import { HttpError, ah, addrParam, bad, clampInt, notFound } from '../lib/http.js';
 import { forgetBan, requireAdminSession } from '../lib/auth.js';
+import { forgetKey } from '../lib/apiKeys.js';
 import { audit, requireRole } from '../lib/admin.js';
 import { decrypt } from '../lib/crypto.js';
-import { COLLECTION_COLS } from '../lib/queries.js';
+import { COLLECTION_COLS, detailCols } from '../lib/queries.js';
+import { cleanAbout, cleanAboutItems, cleanGallery, cleanMediaLink, requireGallery } from '../lib/collectionMedia.js';
 import { discover, importCollection } from '../lib/explorer.js';
 import { SETTING_KEYS, getSettings, setSettings } from '../lib/settings.js';
 import { saveBranding, saveLegal, siteContent } from '../lib/siteContent.js';
@@ -93,7 +95,7 @@ r.get('/collections', requireRole('admin'), ah(async (req, res) => {
 }));
 
 r.get('/collections/:address', requireRole('admin'), ah(async (req, res) => {
-  const row = await one(`select ${COLLECTION_COLS}, c.about, c.about_image_url, c.about_items from collections c where c.address = $1`, [addrParam(req.params.address)]);
+  const row = await one(`select ${COLLECTION_COLS}, ${await detailCols()} from collections c where c.address = $1`, [addrParam(req.params.address)]);
   if (!row) throw notFound('Collection not found');
   res.json({ collection: row });
 }));
@@ -107,24 +109,20 @@ r.patch('/collections/:address', requireRole('admin'), ah(async (req, res) => {
   for (const f of ['verified', 'featured', 'hidden', 'drop_hidden']) if (typeof b[f] === 'boolean') set(f, b[f]);
   if (typeof b.name === 'string' && b.name.trim()) set('name', b.name.trim().slice(0, 80));
   if (typeof b.description === 'string') set('description', b.description.slice(0, 2000));
-  if ('image_url' in b) set('image_url', b.image_url ? String(b.image_url).slice(0, 500) : null);
-  if ('banner_url' in b) set('banner_url', b.banner_url ? String(b.banner_url).slice(0, 500) : null);
+  if ('image_url' in b) set('image_url', cleanMediaLink(b.image_url, 'Logo'));
+  if ('banner_url' in b) set('banner_url', cleanMediaLink(b.banner_url, 'Banner'));
   if ('twitter' in b) set('twitter', url(b.twitter, 'X link'));
   if ('website' in b) set('website', url(b.website, 'website'));
   if ('discord' in b) set('discord', url(b.discord, 'Discord link'));
-  if ('about' in b) set('about', b.about ? String(b.about).slice(0, 8000) : null);
-  if ('about_image_url' in b) {
-    const v = String(b.about_image_url || '').trim();
-    set('about_image_url', /^ipfs:\/\/[^\s]{10,290}$/i.test(v) ? v : url(v, 'About image'));
-  }
-  if ('about_items' in b) {
-    if (!Array.isArray(b.about_items) || b.about_items.length > 12) throw bad('About details: up to 12 rows');
-    const items = b.about_items
-      .map((x) => ({ label: String(x?.label || '').trim().slice(0, 40), value: String(x?.value || '').trim().slice(0, 300) }))
-      .filter((x) => x.label && x.value);
-    set('about_items', JSON.stringify(items));
-  }
+  if ('about' in b) set('about', cleanAbout(b.about));
+  if ('about_image_url' in b) set('about_image_url', cleanMediaLink(b.about_image_url, 'About image'));
+  if ('about_items' in b) set('about_items', JSON.stringify(cleanAboutItems(b.about_items)));
   if ('telegram' in b) set('telegram', url(b.telegram, 'Telegram link'));
+  if ('gallery' in b) {
+    const gallery = cleanGallery(b.gallery);
+    await requireGallery();
+    set('gallery', JSON.stringify(gallery));
+  }
   if (typeof b.slug === 'string') {
     if (!/^[a-z0-9-]{3,60}$/.test(b.slug)) throw bad('Slug must be 3-60 lowercase letters, numbers or dashes');
     set('slug', b.slug);
@@ -137,7 +135,7 @@ r.patch('/collections/:address', requireRole('admin'), ah(async (req, res) => {
   if (!row) throw notFound('Collection not found');
   if (typeof b.featured === 'boolean') await q(`update drops set featured = $2 where collection = $1`, [address, b.featured]);
   await audit(req, 'collection.update', address, b);
-  res.json({ collection: await one(`select ${COLLECTION_COLS}, c.about, c.about_image_url, c.about_items from collections c where c.address = $1`, [address]) });
+  res.json({ collection: await one(`select ${COLLECTION_COLS}, ${await detailCols()} from collections c where c.address = $1`, [address]) });
 }));
 
 /** Removes a collection (and its items, orders and activity) from the marketplace database. On-chain nothing changes. */
@@ -382,8 +380,13 @@ r.post('/users/:address/ban', requireRole('admin'), ah(async (req, res) => {
   const banned = Boolean(req.body?.banned);
   await q(`insert into app.users (address, is_banned) values ($1,$2) on conflict (address) do update set is_banned = excluded.is_banned`, [address, banned]);
   if (banned) await q(`update orders set status = 'inactive', updated_at = now() where maker = $1 and status = 'active'`, [address]);
+  // A banned wallet's API keys are paused too (an admin can turn them back on in API keys after an unban).
+  const paused = banned
+    ? await many(`update app.api_keys set status = 'paused', updated_at = now() where address = $1 and status = 'active' returning key_prefix`, [address]).catch(() => [])
+    : [];
+  paused.forEach((k) => forgetKey(k.key_prefix));
   forgetBan(address);
-  await audit(req, banned ? 'user.ban' : 'user.unban', address);
+  await audit(req, banned ? 'user.ban' : 'user.unban', address, paused.length ? { api_keys_paused: paused.length } : {});
   res.json({ ok: true });
 }));
 
@@ -435,7 +438,7 @@ r.patch('/tickets/:id', requireRole('support'), ah(async (req, res) => {
 }));
 
 // ── Audit log ────────────────────────────────────────────────────────────────
-const AUDIT_CATEGORIES = ['collection', 'safe', 'settings', 'network', 'admin', 'ticket', 'user'];
+const AUDIT_CATEGORIES = ['collection', 'safe', 'settings', 'network', 'admin', 'ticket', 'user', 'apikey'];
 r.get('/audit', requireRole('admin'), ah(async (req, res) => {
   const before = clampInt(req.query.before, 0, Number.MAX_SAFE_INTEGER, 0);
   const limit = clampInt(req.query.limit, 1, 200, 100);

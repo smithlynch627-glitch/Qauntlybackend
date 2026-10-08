@@ -1,19 +1,25 @@
 import { Router } from 'express';
 import { many } from '../db.js';
-import { ah, clampInt } from '../lib/http.js';
+import { addrParam, ah, clampInt } from '../lib/http.js';
+import { optionalAuth } from '../lib/auth.js';
 import { ACTIVITY_SELECT, loadCollection } from '../lib/queries.js';
+import { noSharedCache, requireVisible } from '../lib/privacy.js';
 
 const r = Router();
+r.use(noSharedCache);
 const TYPES = new Set(['mint', 'list', 'delist', 'sale', 'transfer', 'offer', 'offer_cancel', 'collection_offer']);
 
-r.get('/', ah(async (req, res) => {
+r.get('/', optionalAuth, ah(async (req, res) => {
   const params = [];
   const where = ['not c.hidden'];
   const add = (v) => (params.push(v), `$${params.length}`);
   if (req.query.collection) where.push(`a.collection = ${add((await loadCollection(req.query.collection)).address)}`);
   if (req.query.token) where.push(`a.token_id = ${add(String(req.query.token).replace(/\D/g, '') || '0')}`);
   if (req.query.address) {
-    const a = add(String(req.query.address).toLowerCase());
+    // One wallet's history (its profile Activity tab) follows that wallet's privacy setting.
+    const address = addrParam(req.query.address);
+    await requireVisible(req, address, 'activity');
+    const a = add(address);
     where.push(`(a.from_addr = ${a} or a.to_addr = ${a})`);
   }
   const types = String(req.query.types || '').split(',').filter((t) => TYPES.has(t));

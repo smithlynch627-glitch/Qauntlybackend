@@ -79,6 +79,7 @@ export const COLLECTION_ABI = [
   'event MintPausedSet(bool paused)',
   'event ContractURIUpdated(string uri)',
   'event MaxSupplyReduced(uint256 maxSupply)',
+  'event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)',
 ];
 
 export const ERC721_ABI_MIN = [

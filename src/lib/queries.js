@@ -7,6 +7,8 @@ import { publicBranding } from './siteContent.js';
 import { many, one } from '../db.js';
 import { notFound } from './http.js';
 import { dropState } from './drops.js';
+import { galleryCol } from './collectionMedia.js';
+import { DEFAULTS as API_DEFAULTS, MAX_KEYS as API_MAX_KEYS } from './apiKeys.js';
 
 export const COLLECTION_COLS = `c.address, c.slug, c.name, c.symbol, c.description, c.image_url, c.banner_url, c.art_style,
   c.creator, c.royalty_bps, c.royalty_receiver, c.max_supply, c.total_supply, c.verified, c.is_official, c.is_external,
@@ -22,14 +24,16 @@ export const BEST_LISTING_JOIN = `left join lateral (
   where o.collection = t.collection and o.token_id = t.token_id and o.kind = 'listing' and o.status = 'active'
   order by o.price_wei asc limit 1) l on true`;
 
-/** Long "About" fields are only sent with a single collection, never in lists. */
+/** Long "About" fields and the extra images are only sent with a single collection, never in lists. */
 const ABOUT_COLS = `c.about, c.about_image_url, c.about_items`;
+export const detailCols = async () => `${ABOUT_COLS}, ${await galleryCol()}`;
 
 export async function loadCollection(key, { includeHidden = false } = {}) {
   const k = String(key).toLowerCase();
+  const extra = await detailCols();
   const col = isAddress(k)
-    ? await one(`select ${COLLECTION_COLS}, ${ABOUT_COLS} from collections c where c.address = $1`, [k])
-    : await one(`select ${COLLECTION_COLS}, ${ABOUT_COLS} from collections c where c.slug = $1`, [k]);
+    ? await one(`select ${COLLECTION_COLS}, ${extra} from collections c where c.address = $1`, [k])
+    : await one(`select ${COLLECTION_COLS}, ${extra} from collections c where c.slug = $1`, [k]);
   if (!col || (col.hidden && !includeHidden)) throw notFound('Collection not found');
   return col;
 }
@@ -112,6 +116,8 @@ export async function publicConfig() {
     mintFeeBps: fees.mintFeeBps ?? null,
     official: { address: config.officialCollection || null, slug: config.officialSlug },
     ipfsUploads: Boolean(config.pinataJwt),
+    // Developer API: the limits a new free key gets, for the Developers page.
+    api: { perMinute: API_DEFAULTS.perMinute, perDay: API_DEFAULTS.perDay, maxKeys: API_MAX_KEYS },
     // Creators must connect an X account before launching (the collection's X link comes from it).
     xConnect: Boolean(config.x.clientId && config.x.redirectUri),
     // The site loads IPFS images through this gateway first (e.g. your Pinata dedicated gateway), then public ones.
