@@ -364,7 +364,7 @@ r.get('/drops', ah(async (req, res) => {
   );
   let drops = rows.map(({ phases, platform_fee_bps, drop_featured, ...collection }) => ({
     collection, featured: drop_featured, platformFeeBps: platform_fee_bps,
-    ...dropState(publicPhases(phases), collection.total_supply, collection.max_supply),
+    ...dropState(publicPhases(phases), collection.total_supply, collection.mint_cap ?? collection.max_supply),
   }));
   const status = String(req.query.status || '');
   if (status) {

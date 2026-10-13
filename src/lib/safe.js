@@ -53,7 +53,10 @@ const OWNABLE_ABI = [
 // transfers from the Safe (empty data) are allowed to any address. Everything else is refused before it is stored.
 const CALLS = {
   market: ['setMarketFeeBps(uint16)', 'setFeeRecipient(address)', 'setCollectionApproval(address,bool)', 'setCollectionBlocked(address,bool)',
-    'setFactory(address,bool)', 'pause()', 'unpause()', 'setGuardian(address)', 'acceptOwnership()'],
+    'setFactory(address,bool)', 'pause()', 'unpause()', 'setGuardian(address)', 'acceptOwnership()',
+    // Signature safety (market version 4): the emergency switch for wallet signatures, and the gas budgets for
+    // contract-wallet (ERC-1271) signatures. The contract enforces the bounds; older markets simply reject the call.
+    'setWalletSignaturesOff(bool)', 'setContractSignatureGas(uint32,uint32)'],
   factory: ['setPlatformFeeBps(uint16)', 'pause()', 'unpause()', 'acceptOwnership()'],
   vault: ['withdrawNative(address,uint256)', 'withdrawAllNative(address)', 'withdrawToken(address,address,uint256)', 'setFactory(address,bool)', 'acceptOwnership()'],
   wrapped: ['transfer(address,uint256)', 'withdraw(uint256)'],
@@ -119,29 +122,59 @@ export function checkCall({ to, value, data }, t) {
 // ── Safe reads ─────────────────────────────────────────────────────────────────
 export const safeContract = (address) => new Contract(address, SAFE_ABI, getProvider());
 
-let cache = { at: 0, market: '', value: null };
-/** The Safe that owns the marketplace, or null when the owner is a normal wallet. Cached 20 s. */
+let cache = { at: 0, market: '', value: null, pending: false, owner: null };
+/** True when `address` is a contract that answers like a Safe (it has owners and a threshold). */
+async function looksLikeSafe(address) {
+  if (!address || address === lc(ZeroAddress)) return false;
+  if ((await getProvider().getCode(address)) === '0x') return false;
+  return (await safeContract(address).getThreshold().catch(() => null)) !== null;
+}
+/**
+ * The Safe that owns the marketplace, or null when the owner is a normal wallet. Cached 20 s.
+ * Handover in progress: when the owner is still a normal wallet but the marketplace has been OFFERED to a Safe
+ * (Ownable2Step pendingOwner), that Safe is returned with `pending` true (currentSafeInfo). The panel then lets it propose
+ * acceptOwnership (and nothing else), so the owners can finish the handover with their signatures.
+ */
+async function loadSafe() {
+  if (Date.now() - cache.at < 20_000 && cache.market === config.market) return cache;
+  const m = new Contract(config.market, OWNABLE_ABI, getProvider());
+  const owner = lc(await m.owner());
+  let value = null;
+  let pending = false;
+  if (await looksLikeSafe(owner)) value = owner;
+  else {
+    const offered = lc(await m.pendingOwner().catch(() => ZeroAddress));
+    if (await looksLikeSafe(offered)) {
+      value = offered;
+      pending = true;
+    }
+  }
+  cache = { at: Date.now(), market: config.market, value, pending, owner };
+  return cache;
+}
 export async function currentSafe() {
   if (!config.market) return null;
-  if (Date.now() - cache.at < 20_000 && cache.market === config.market) return cache.value;
-  const owner = lc(await marketContract().owner());
-  let value = null;
-  if ((await getProvider().getCode(owner)) !== '0x') {
-    const threshold = await safeContract(owner).getThreshold().catch(() => null);
-    if (threshold !== null) value = owner;
-  }
-  cache = { at: Date.now(), market: config.market, value, owner };
-  return value;
+  return (await loadSafe()).value;
+}
+/**
+ * The Safe and whether its handover is still pending, read from ONE snapshot, so a refresh running in parallel
+ * cannot pair this request's Safe with another request's pending flag.
+ */
+export async function currentSafeInfo() {
+  if (!config.market) return { safe: null, pending: false };
+  const c = await loadSafe();
+  return { safe: c.value, pending: Boolean(c.value && c.pending) };
 }
 export const marketOwner = () => cache.owner || null;
 
 export async function safeState(safe) {
   const s = safeContract(safe);
   const p = getProvider();
-  const [owners, threshold, nonce, version, modules, guardRaw, fallbackRaw] = await Promise.all([
+  const [owners, threshold, nonce, version, modules, guardRaw, fallbackRaw, singletonRaw] = await Promise.all([
     s.getOwners(), s.getThreshold(), s.nonce(), s.VERSION().catch(() => 'unknown'),
     s.getModulesPaginated(SENTINEL, 10).then((r) => r[0]).catch(() => null),
     p.getStorage(safe, GUARD_SLOT).catch(() => null), p.getStorage(safe, FALLBACK_SLOT).catch(() => null),
+    p.getStorage(safe, 0).catch(() => null), // a Safe proxy keeps its singleton (the Safe code it runs) in slot 0
   ]);
   const slotAddr = (v) => (v ? lc(getAddress(`0x${v.slice(-40)}`)) : null);
   return {
@@ -153,6 +186,7 @@ export async function safeState(safe) {
     modules: modules ? modules.map(lc) : null,
     guard: slotAddr(guardRaw),
     fallbackHandler: slotAddr(fallbackRaw),
+    singleton: slotAddr(singletonRaw),
   };
 }
 

@@ -378,6 +378,8 @@ begin
   execute format('alter table %I.collections add column if not exists drop_hidden boolean not null default false', s);
   -- up to three extra images shown with the logo on the mint page (set by the creator or an admin)
   execute format($a$alter table %I.collections add column if not exists gallery jsonb not null default '[]'$a$, s);
+  -- How far mints can go (v3 collections set the team reserve aside), so a drop shows "sold out" at the right moment.
+  execute format('alter table %I.collections add column if not exists mint_cap integer check (mint_cap is null or mint_cap >= 0)', s);
   -- limits on the extra images and the About fields, enforced by the database itself whatever the API sends
   if not exists (select 1 from pg_constraint where conname = 'collections_gallery_check' and conrelid = format('%I.collections', s)::regclass) then
     execute format($a$alter table %I.collections add constraint collections_gallery_check
@@ -516,10 +518,21 @@ begin
 
   execute format('create table if not exists %I.indexer_state (key text primary key, value text not null)', s);
 
+  -- Reorg safety: the block every processed transaction came from. If that block is replaced on the chain
+  -- (proof-of-work, no finality layer yet), the indexer undoes what the transaction wrote and reads it again.
+  execute format($ddl$
+    create table if not exists %1$I.indexed_txs (
+      tx_hash             text primary key check (tx_hash ~ '^0x[0-9a-f]{64}$'),
+      block_number        bigint not null check (block_number >= 0),
+      block_hash          text not null check (block_hash ~ '^0x[0-9a-f]{64}$'),
+      created_collections text[] not null default '{}'
+    )$ddl$, s);
+  execute format('create index if not exists indexed_txs_block on %I.indexed_txs (block_number)', s);
+
   -- Lock it down exactly like the app schema.
   execute format('revoke all on schema %I from public', s);
   execute format('grant usage on schema %I to quantly_api', s);
-  foreach t in array array['collections','tokens','orders','activity','drops','allowlists','fee_ledger','indexer_state','phase_changes','snapshots'] loop
+  foreach t in array array['collections','tokens','orders','activity','drops','allowlists','fee_ledger','indexer_state','phase_changes','snapshots','indexed_txs'] loop
     execute format('alter table %I.%I enable row level security', s, t);
     execute format('drop policy if exists api_all on %I.%I', s, t);
     execute format('create policy api_all on %I.%I for all to quantly_api using (true) with check (true)', s, t);
@@ -689,6 +702,13 @@ checks (n, what, bad, detail) as (
          2 - (select count(*)::int from pg_attribute where attrelid = 'app.users'::regclass
                 and attname in ('hide_collected', 'hide_activity') and not attisdropped),
          'hide collected items / hide activity'
+  union all
+  select 18, 'Reorg protection and the team-reserve column are installed on every chain',
+         (select count(*) from scope s where s.nspname <> 'app'
+            and (not exists (select 1 from pg_class c where c.relnamespace = s.oid and c.relname = 'indexed_txs' and c.relrowsecurity)
+              or not exists (select 1 from pg_attribute a join pg_class c on c.oid = a.attrelid
+                              where c.relnamespace = s.oid and c.relname = 'collections' and a.attname = 'mint_cap' and not a.attisdropped))),
+         'indexed_txs and collections.mint_cap per chain'
 )
 select n as "#", what as "check", case when bad = 0 then 'PASS' else 'FAIL' end as result, bad as problems, detail
 from checks order by n;

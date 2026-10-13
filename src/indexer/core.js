@@ -7,6 +7,7 @@ import { many, one, q } from '../db.js';
 import { COLLECTION_ABI, FACTORY_ABI, MARKET_ABI, collectionContract, getProvider, market as marketContract } from '../lib/chain.js';
 import { refreshCollectionStats } from '../lib/stats.js';
 import { safeGet, safeProbe } from '../lib/safeFetch.js';
+import { beginTx, noteCreatedCollection } from './reorg.js';
 
 const colIface = new Interface(COLLECTION_ABI);
 const marketIface = new Interface(MARKET_ABI);
@@ -26,6 +27,7 @@ const TOPIC = {
   mintPaused: T(colIface, 'MintPausedSet'),
   contractUri: T(colIface, 'ContractURIUpdated'),
   supplyReduced: T(colIface, 'MaxSupplyReduced'),
+  airdropped: T(colIface, 'Airdropped'),
   ownership: T(colIface, 'OwnershipTransferred'),
 };
 
@@ -169,6 +171,9 @@ export async function syncCollectionFromChain(address, creator = null, createdAt
     [address, config.chainId, slug, name, symbol, lc(creator || owner), Number(royalty[1]), lc(royalty[0]), Number(maxSupply), Number(totalSupply), createdAt,
       revealed, frozen, paused, contractUri || null],
   );
+  // v3: how far mints can go (the team reserve is set aside). Older collections have no such function.
+  const cap = await c.mintableSupply().catch(() => null);
+  if (cap !== null) await q(`update collections set mint_cap = $2 where address = $1`, [address, Number(cap)]).catch(() => {});
   await syncPhases(address, phases, ctx);
   await applyCollectionFlags();
 }
@@ -291,6 +296,11 @@ export async function processLogs(logs) {
 
   for (const [txHash, group] of byTx) {
     group.sort((a, b) => a.index - b.index);
+    // Only Quantly transactions (anyone can ask the sync route to read any transaction).
+    if (!group.some((l) => { const a = lc(l.address); return a === config.market || a === config.factory || known.has(a); })) continue;
+    // Remember which block these logs came from; if this transaction was processed before from another block
+    // (a chain reorganisation), what it wrote then is undone first, so nothing is ever counted twice.
+    if (!(await beginTx(txHash, group[0].blockNumber, group[0].blockHash))) continue;
     const ts = await blockTime(group[0].blockNumber);
     const sold = new Set();
     const mintPrice = new Map();
@@ -301,6 +311,7 @@ export async function processLogs(logs) {
       const ev = parse(factoryIface, log);
       if (ev?.name === 'CollectionCreated') {
         const address = lc(ev.args.collection);
+        await noteCreatedCollection(txHash, address);
         await syncCollectionFromChain(address, lc(ev.args.creator), ts);
         known.add(address);
       }
@@ -330,7 +341,7 @@ export async function processLogs(logs) {
         if (topic === TOPIC.revealed) await q(`update collections set revealed = true where address = $1`, [address]);
         const ids = await many(`select token_id::text as id from tokens where collection = $1 order by token_id limit 20000`, [address]);
         ids.forEach((r) => queueMetadata(address, r.id));
-      } else if ([TOPIC.frozen, TOPIC.mintPaused, TOPIC.contractUri, TOPIC.supplyReduced].includes(topic)) {
+      } else if ([TOPIC.frozen, TOPIC.mintPaused, TOPIC.contractUri, TOPIC.supplyReduced, TOPIC.airdropped].includes(topic)) {
         if (topic === TOPIC.mintPaused || topic === TOPIC.supplyReduced) {
           const ev = parse(colIface, log);
           const d = await one(`select phases from drops where collection = $1`, [address]);
@@ -381,10 +392,18 @@ export async function processLogs(logs) {
           touched.add(c);
         }
       } else if (ev.name === 'CounterIncremented') {
+        // Every order whose counter is not the maker's CURRENT counter is dead on-chain. The counter is read from the
+        // chain: a "cancel all" mined again after a reorg lands on a different value, and the bump is not +1.
+        // The transaction is noted on the orders, so a reorg that undoes it can reopen them.
+        const maker = lc(ev.args.maker);
+        const current = await marketContract().counters(maker).then((c) => c.toString()).catch(() => null);
         const rows = await many(
-          `update orders set status = 'cancelled', updated_at = now()
-           where maker = $1 and counter < $2 and status in ('active','inactive') returning collection`,
-          [lc(ev.args.maker), ev.args.newCounter.toString()],
+          current
+            ? `update orders set status = 'cancelled', tx_hash = $3, updated_at = now()
+               where maker = $1 and counter <> $2 and status in ('active','inactive') returning collection`
+            : `update orders set status = 'cancelled', tx_hash = $3, updated_at = now()
+               where maker = $1 and counter < $2 and status in ('active','inactive') returning collection`,
+          [maker, current ?? ev.args.newCounter.toString(), txHash],
         );
         rows.forEach((r) => touched.add(r.collection));
       }

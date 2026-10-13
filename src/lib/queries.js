@@ -13,7 +13,8 @@ import { DEFAULTS as API_DEFAULTS, MAX_KEYS as API_MAX_KEYS } from './apiKeys.js
 export const COLLECTION_COLS = `c.address, c.slug, c.name, c.symbol, c.description, c.image_url, c.banner_url, c.art_style,
   c.creator, c.royalty_bps, c.royalty_receiver, c.max_supply, c.total_supply, c.verified, c.is_official, c.is_external,
   c.featured, c.hidden, c.tradable, c.revealed, c.metadata_frozen, c.mint_paused, c.drop_hidden, c.contract_uri, c.twitter, c.website, c.discord, c.telegram, c.floor_wei, c.best_offer_wei, c.volume_wei, c.volume_24h_wei, c.sales_count,
-  c.owners_count, c.listed_count, c.created_at`;
+  c.owners_count, c.listed_count, c.created_at,
+  (to_jsonb(c)->>'mint_cap')::int as mint_cap`; // read this way so the site keeps working before the column exists
 
 export const TOKEN_COLS = `t.collection, t.token_id::text as token_id, t.owner, t.name, t.image_url, t.attributes,
   t.rarity_rank, t.last_sale_wei,
@@ -48,7 +49,7 @@ export async function loadDrop(col) {
     `select id, tx_hash, changes, changed_at from phase_changes where collection = $1 order by changed_at desc, id desc limit 20`,
     [col.address],
   ).catch(() => []);
-  return { ...dropState(phases, col.total_supply, col.max_supply), platformFeeBps: d.platform_fee_bps, featured: d.featured, changes };
+  return { ...dropState(phases, col.total_supply, col.mint_cap ?? col.max_supply), platformFeeBps: d.platform_fee_bps, featured: d.featured, changes };
 }
 
 /** Value used for "this item has no <trait type>" (e.g. no Hat), in trait counts and filters. */

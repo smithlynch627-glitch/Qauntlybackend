@@ -228,8 +228,18 @@ r.get('/chain', requireRole('admin'), ah(async (_req, res) => {
   const [guardian, version] = await Promise.all([
     guardianOf(), new Contract(config.market, ['function version() view returns (uint256)'], getProvider()).version().then(Number).catch(() => 1),
   ]);
+  // Market version 4: the emergency switch for wallet signatures and the contract-signature gas budgets.
+  let signatures = null;
+  if (version >= 4) {
+    const sm = new Contract(config.market, [
+      'function walletSignaturesOff() view returns (bool)', 'function contractSignatureGas() view returns (uint32)',
+      'function sweepContractSignatureGas() view returns (uint32)',
+    ], getProvider());
+    const got = await Promise.all([sm.walletSignaturesOff(), sm.contractSignatureGas(), sm.sweepContractSignatureGas()]).catch(() => null);
+    if (got) signatures = { walletOff: Boolean(got[0]), single: Number(got[1]), sweep: Number(got[2]) };
+  }
   res.json({
-    factories, guardian, marketVersion: version,
+    factories, guardian, marketVersion: version, signatures,
     ready: true, block, market: { address: config.market, owner: mOwner, paused: mPaused, feeBps: Number(mFee), feeRecipient: fRecipient },
     factory: { address: config.factory, owner: fOwner, paused: fPaused, feeBps: Number(fFee) },
     vault: { address: config.feeVault, owner: vaultOwner, native: vaultNative.toString(), wrapped: vaultWrapped.toString() }, wrapped: config.wrapped,

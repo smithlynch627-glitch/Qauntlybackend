@@ -100,6 +100,13 @@ checks (n, what, bad, detail) as (
          2 - (select count(*)::int from pg_attribute where attrelid = 'app.users'::regclass
                 and attname in ('hide_collected', 'hide_activity') and not attisdropped),
          'hide collected items / hide activity'
+  union all
+  select 18, 'Reorg protection and the team-reserve column are installed on every chain',
+         (select count(*) from scope s where s.nspname <> 'app'
+            and (not exists (select 1 from pg_class c where c.relnamespace = s.oid and c.relname = 'indexed_txs' and c.relrowsecurity)
+              or not exists (select 1 from pg_attribute a join pg_class c on c.oid = a.attrelid
+                              where c.relnamespace = s.oid and c.relname = 'collections' and a.attname = 'mint_cap' and not a.attisdropped))),
+         'indexed_txs and collections.mint_cap per chain'
 )
 select n as "#", what as "check", case when bad = 0 then 'PASS' else 'FAIL' end as result, bad as problems, detail
 from checks order by n;

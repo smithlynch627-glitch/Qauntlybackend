@@ -24,7 +24,7 @@ r.get('/', ah(async (req, res) => {
   const order = { live: 0, upcoming: 1, sold_out: 2, ended: 3 };
   let drops = rows.map(({ phases, platform_fee_bps, featured, ...collection }) => ({
     collection, featured, platformFeeBps: platform_fee_bps,
-    ...dropState(publicPhases(phases), collection.total_supply, collection.max_supply),
+    ...dropState(publicPhases(phases), collection.total_supply, collection.mint_cap ?? collection.max_supply),
   }));
   const status = String(req.query.status || '');
   if (status) drops = drops.filter((d) => (status === 'ended' ? ['ended', 'sold_out'].includes(d.status) : d.status === status));

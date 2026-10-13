@@ -7,8 +7,7 @@ import { ah, bad, clampInt, notFound } from '../lib/http.js';
 import { audit, requireRole } from '../lib/admin.js';
 import { getProvider } from '../lib/chain.js';
 import {
-  checkCall, currentSafe, guardianOf, managedContracts, marketOwner, OFFICIAL, proposalTargets, recoverSigner, safeContract,
-  safeIface, safeState, safeTxHash,
+  checkCall, currentSafe, currentSafeInfo, guardianOf, managedContracts, marketOwner, OFFICIAL, proposalTargets, recoverSigner, safeContract, safeIface, safeState, safeTxHash,
 } from '../lib/safe.js';
 import { executedHashes, executedNonces, refreshTreasury, safeHistory, vaultWithdrawals } from '../lib/treasury.js';
 
@@ -25,6 +24,7 @@ const KIND = {
   withdrawNative: 'withdraw', withdrawAllNative: 'withdraw', withdrawToken: 'withdraw', transfer: 'transfer', withdraw: 'transfer',
   setMarketFeeBps: 'fees', setPlatformFeeBps: 'fees', setFeeRecipient: 'fees', pause: 'pause', unpause: 'pause',
   setCollectionApproval: 'collection', setCollectionBlocked: 'collection', setFactory: 'factory', setGuardian: 'guardian',
+  setWalletSignaturesOff: 'signatures', setContractSignatureGas: 'signatures',
   acceptOwnership: 'ownership', addOwnerWithThreshold: 'owners', removeOwner: 'owners', swapOwner: 'owners', changeThreshold: 'owners', cancel: 'cancel',
 };
 
@@ -81,6 +81,9 @@ function healthChecks(state, managed, guardian) {
   c.push(!state.guard || /^0x0{40}$/.test(state.guard)
     ? { id: 'guard', ok: true, title: 'No transaction guard', detail: 'Standard Safe behaviour.' }
     : { id: 'guard', ok: false, level: 'warning', title: 'A transaction guard is set', detail: `Guard ${state.guard} checks every transaction. Make sure you set it.` });
+  c.push(state.singleton === OFFICIAL.singletonL2
+    ? { id: 'singleton', ok: true, title: 'Official Safe contract', detail: 'Runs the audited Safe v1.3.0 (L2) code.' }
+    : { id: 'singleton', ok: false, level: 'danger', title: 'Unknown Safe contract', detail: `${state.singleton || 'unknown'} is not the official Safe v1.3.0 code. Do not use this Safe.` });
   c.push(state.fallbackHandler === OFFICIAL.fallbackHandler
     ? { id: 'fallback', ok: true, title: 'Official fallback handler', detail: 'Safe v1.3.0 CompatibilityFallbackHandler.' }
     : { id: 'fallback', ok: false, level: 'warning', title: 'Unknown fallback handler', detail: `${state.fallbackHandler || 'none'} is not the official handler.` });
@@ -98,7 +101,7 @@ export function treasuryRoutes(r) {
   // ── Multisig status ──────────────────────────────────────────────────────────
   r.get('/safe', requireRole('admin'), ah(async (_req, res) => {
     if (!config.market) return res.json({ ready: false });
-    const safe = await currentSafe();
+    const { safe, pending } = await currentSafeInfo();
     const [managed, guardian] = await Promise.all([managedContracts(safe), guardianOf()]);
     if (!safe) return res.json({ ready: true, safe: null, owner: marketOwner(), managed, guardian });
     const [state, balances, scan] = await Promise.all([safeState(safe), balancesOf(safe), refreshTreasury(1500)]);
@@ -106,7 +109,7 @@ export function treasuryRoutes(r) {
     const roles = new Map(admins.map((a) => [a.address, a.role]));
     const owners = state.owners.map((a) => ({ address: a, panelRole: config.rootAdmins.includes(a) ? 'owner' : roles.get(a) || null }));
     res.json({
-      ready: true, safe: { ...state, owners, balances }, managed, guardian, checks: healthChecks(state, managed, guardian),
+      ready: true, safe: { ...state, owners, balances, pending }, managed, guardian, checks: healthChecks(state, managed, guardian),
       history: await safeHistory(safe, 60), scan,
     });
   }));
@@ -152,7 +155,7 @@ export function treasuryRoutes(r) {
   }));
 
   r.post('/proposals', requireRole('admin'), ah(async (req, res) => {
-    const safe = await currentSafe();
+    const { safe, pending } = await currentSafeInfo();
     if (!safe) throw bad('The marketplace is not owned by a Safe, so there is nothing to propose.');
     const b = req.body || {};
     const to = lc(b.to);
@@ -162,6 +165,11 @@ export function treasuryRoutes(r) {
     if (!/^\d{1,78}$/.test(String(b.value ?? '0'))) throw bad('Invalid value');
     const value = BigInt(String(b.value ?? '0'));
     const call = checkCall({ to, value, data }, await proposalTargets(safe));
+    // Handover in progress: the Safe was offered the marketplace but does not own it yet. Until it accepts,
+    // the only thing it can be asked to do is accept (or skip a nonce).
+    if (pending && !['acceptOwnership', 'cancel'].includes(call.fn)) {
+      throw bad('The handover is not finished yet. Until the Safe owns the marketplace, it can only accept ownership.');
+    }
     const kind = KIND[call.fn] || 'other';
     const label = cleanLabel(b.label) || `${call.role}.${call.fn}`;
 

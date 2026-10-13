@@ -5,26 +5,31 @@ import { loadNetwork } from '../lib/network.js';
 import { collectionContract, getProvider } from '../lib/chain.js';
 import { expireOrders, refreshAllStats, takeSnapshots } from '../lib/stats.js';
 import { applyCollectionFlags, backfillMetadata, computeRarity, knownCollections, processLogs, repairCollection, repairRawCidImages } from './core.js';
+import { REORG_WINDOW, checkReorgs, pruneIndexedTxs, rollbackCount } from './reorg.js';
 
 const CHUNK = 2000;
 // QMS produces blocks by proof-of-work and the current testnet has no finality layer: the `safe` and `finalized`
 // block tags return the genesis block, and the newest block can still be replaced by a competing one. So the
 // indexer never asks for those tags; it stays CONFIRMATIONS blocks behind the head (about 30 s at 10 s blocks)
 // and re-reads the last OVERLAP blocks every round (already-processed logs are skipped), which also covers a
-// load-balanced RPC whose getLogs node is a little behind. A periodic check against the contracts repairs
-// anything that still slipped through.
+// load-balanced RPC whose getLogs node is a little behind. Deeper reorganisations are handled in reorg.js: every
+// processed transaction is remembered with its block, and if that block is replaced, what the transaction wrote is
+// undone and the range is read again. A periodic check against the contracts repairs anything that still slipped
+// through.
 const CONFIRMATIONS = Number(process.env.INDEXER_CONFIRMATIONS ?? 3);
 const OVERLAP = Number(process.env.INDEXER_OVERLAP ?? 30);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const seen = new Map(); // "<tx>:<logIndex>" → true, most recent ~30k logs
+// Keyed by block hash too: the same transaction from a different block (after a reorg) is new and gets processed.
+const seen = new Map(); // "<block>:<tx>:<logIndex>" → true, most recent ~30k logs
+const logKey = (l) => `${l.blockHash}:${l.transactionHash}:${l.index}`;
 function freshLogs(logs) {
-  const newTx = new Set(logs.filter((l) => !seen.has(`${l.transactionHash}:${l.index}`)).map((l) => l.transactionHash));
+  const newTx = new Set(logs.filter((l) => !seen.has(logKey(l))).map((l) => l.transactionHash));
   // Keep every log of a transaction that has anything new (sales need the transfer and the fill together).
   return logs.filter((l) => newTx.has(l.transactionHash));
 }
 function markSeen(logs) {
-  for (const l of logs) seen.set(`${l.transactionHash}:${l.index}`, true);
+  for (const l of logs) seen.set(logKey(l), true);
   while (seen.size > 30_000) seen.delete(seen.keys().next().value);
 }
 async function readLogs(provider, addresses, fromBlock, toBlock) {
@@ -69,9 +74,48 @@ async function checkContractsChanged() {
   await q(`insert into indexer_state (key, value) values ('contracts', $1) on conflict (key) do update set value = excluded.value`, [key]);
 }
 
+/** Hash of the last block the indexer finished, to notice when that block itself is replaced. */
+async function getCursorHash() {
+  return (await one(`select value from indexer_state where key = 'last_block_hash'`))?.value || null;
+}
+const setCursorHash = (h) =>
+  q(`insert into indexer_state (key, value) values ('last_block_hash', $1) on conflict (key) do update set value = excluded.value`, [h]);
+
+/**
+ * Before reading new blocks: undo transactions whose blocks were replaced, and if the last block read is no longer
+ * on the chain, step back so the replaced range is read again (blocks the indexer passed may now hold new events).
+ */
+let rollbacksSeen = 0;
+async function guardReorgs(provider, head) {
+  let cursor = await getCursor();
+  const lowest = await checkReorgs(provider, head);
+  if (lowest !== null && lowest <= cursor) {
+    cursor = lowest - 1;
+    await setCursor(cursor);
+  }
+  // After any rollback, logs read before must be processed again when the range is re-read.
+  if (rollbackCount !== rollbacksSeen) {
+    rollbacksSeen = rollbackCount;
+    seen.clear();
+  }
+  const stored = await getCursorHash();
+  if (stored && cursor >= (config.indexerStartBlock || 0)) {
+    const block = await provider.getBlock(cursor).catch(() => null);
+    if (block?.hash && String(block.hash).toLowerCase() !== stored) {
+      const back = Math.max(cursor - REORG_WINDOW, (config.indexerStartBlock || 1) - 1);
+      console.log(`[reorg] block ${cursor} was replaced: reading again from block ${back + 1}`);
+      await setCursor(back);
+      await setCursorHash('');
+      seen.clear();
+    }
+  }
+}
+
 async function tick() {
   const provider = getProvider();
-  const latest = (await provider.getBlockNumber()) - CONFIRMATIONS;
+  const head = await provider.getBlockNumber();
+  await guardReorgs(provider, head);
+  const latest = head - CONFIRMATIONS;
   const cursor = await getCursor();
   let from = Math.max(cursor + 1 - OVERLAP, config.indexerStartBlock || 0, 0);
   while (from <= latest) {
@@ -82,7 +126,11 @@ async function tick() {
     // (mints, transfers, phase changes) in the same range are read now. Processing is idempotent.
     const added = [...(await knownCollections())].filter((a) => !before.has(a));
     if (added.length) await readLogs(provider, added, from, to);
-    if (to > cursor) await setCursor(to);
+    if (to > cursor) {
+      await setCursor(to);
+      const b = await provider.getBlock(to).catch(() => null);
+      if (b?.hash) await setCursorHash(String(b.hash).toLowerCase());
+    }
     from = to + 1;
   }
   return latest;
@@ -145,6 +193,7 @@ async function main() {
       if (Date.now() - lastMaintenance > 60_000) {
         const expired = await expireOrders();
         await refreshAllStats();
+        await pruneIndexedTxs(await getProvider().getBlockNumber()).catch(() => {});
         await takeSnapshots().catch((e) => console.warn('[snapshots]', e.message));
         await backfillMetadata().catch((e) => console.warn('[metadata]', e.message));
         lastMaintenance = Date.now();

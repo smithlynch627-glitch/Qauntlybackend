@@ -79,6 +79,8 @@ export const COLLECTION_ABI = [
   'event MintPausedSet(bool paused)',
   'event ContractURIUpdated(string uri)',
   'event MaxSupplyReduced(uint256 maxSupply)',
+  'event Airdropped(uint256 firstTokenId, uint256 quantity)',
+  'function mintableSupply() view returns (uint256)',
   'event OwnershipTransferred(address indexed previousOwner, address indexed newOwner)',
 ];
 
