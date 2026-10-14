@@ -82,6 +82,10 @@ async function ownerNow(collection, id) {
     return lc(await collectionContract(collection).ownerOf(id));
   } catch (e) {
     if (e?.code === 'CALL_EXCEPTION') return null; // the contract says this token does not exist
+    // No contract at that address any more (its creation was undone, or the testnet was reset): the token does not
+    // exist either. Without this, the empty answer fails to decode and the rollback would retry forever.
+    const code = await getProvider().getCode(collection).catch(() => null);
+    if (code === '0x') return null;
     throw e;
   }
 }
